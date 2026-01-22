@@ -140,11 +140,84 @@ print(f"Overlap pixels: {np.sum(air_mask & magnet_mask)}")
 # EXPORT FUNCTIONS
 # ==========================================
 
+# ==========================================
+# EXPORT FUNCTIONS (HYBRID & SMART)
+# ==========================================
+from skimage.measure import approximate_polygon
+
+def apply_hybrid_processing(contour_pixels, pixel_size_x, pixel_size_y, R_in, R_out):
+    """
+    THUẬT TOÁN HYBRID:
+    1. Chuyển đổi Pixel -> MM.
+    2. Làm mượt toàn bộ (Smooth) để khử răng cưa bên trong.
+    3. Xử lý biên (Snap & Overshoot): Nếu điểm nằm gần biên, ép nó ra ngoài hẳn.
+    """
+    # 1. Chuyển sang tọa độ thực (MM)
+    # Lưu ý: contour của skimage trả về (row, col) -> (y, x)
+    points_mm = []
+    for row, col in contour_pixels:
+        x = (col - 2) * pixel_size_x  # Trừ padding
+        y = (row - 2) * pixel_size_y
+        points_mm.append([x, y])
+    
+    # 2. LÀM MƯỢT (SMOOTHING)
+    # tolerance=0.05mm: Đủ lớn để xóa răng cưa pixel (0.04mm), đủ nhỏ để giữ dáng cong
+    points_array = np.array(points_mm)
+    simplified_array = approximate_polygon(points_array, tolerance=0.05)
+    
+    # 3. XỬ LÝ BIÊN (SNAP & OVERSHOOT)
+    # Mục tiêu: Đảm bảo biên cắt sạch, không để lại răng cưa ở R_out hay 0 độ
+    final_points = []
+    
+    # Ngưỡng để nhận diện điểm biên (dựa trên sai số làm mượt + pixel)
+    # Nếu điểm cách biên < 0.8mm thì coi như là điểm biên -> Đẩy lố ra
+    BOUNDARY_THRESHOLD = 0.8 
+    OVERSHOOT_VAL = 1.0 # Đẩy ra ngoài 1mm để cắt cho ngọt
+    
+    for p in simplified_array:
+        x, y = p[0], p[1]
+        r = np.sqrt(x**2 + y**2)
+        
+        new_x, new_y = x, y
+        is_boundary_point = False
+        
+        # --- Check R_out (Biên ngoài) ---
+        if abs(r - R_out) < BOUNDARY_THRESHOLD:
+            # Đẩy bán kính ra R_out + 1mm
+            ratio = (R_out + OVERSHOOT_VAL) / r
+            new_x *= ratio
+            new_y *= ratio
+            is_boundary_point = True
+            
+        # --- Check R_in (Biên trong - nếu có) ---
+        elif abs(r - R_in) < BOUNDARY_THRESHOLD:
+            # Đẩy bán kính vào R_in - 1mm
+            ratio = (R_in - OVERSHOOT_VAL) / r
+            new_x *= ratio
+            new_y *= ratio
+            is_boundary_point = True
+
+        # --- Check Góc 0 độ (Trục X) ---
+        # Nếu y rất nhỏ -> Đẩy y xuống âm
+        if abs(y) < BOUNDARY_THRESHOLD and x > 0:
+            new_y = -OVERSHOOT_VAL
+            is_boundary_point = True
+            
+        # --- Check Góc 90 độ (Trục Y) ---
+        # Nếu x rất nhỏ -> Đẩy x xuống âm (sang trái)
+        if abs(x) < BOUNDARY_THRESHOLD and y > 0:
+            new_x = -OVERSHOOT_VAL
+            is_boundary_point = True
+            
+        final_points.append((new_x, new_y))
+        
+    return final_points
+
 def export_air_with_layers(binary_mask, pixel_size_x, pixel_size_y, msp):
     """
-    Export Air với 2 layers - NỘI SUY PIXEL (không simplify)
-    - CUT_GROUP: viền ngoài (cắt khỏi rotor)
-    - KEEP_GROUP: viền lỗ bên trong (giữ lại = đảo thép)
+    Export Air với chiến thuật Hybrid:
+    - Vỏ ngoài (CUT_GROUP): Overshoot mạnh để cắt biên.
+    - Đảo trong (KEEP_GROUP): Chỉ làm mượt, giữ nguyên vị trí.
     """
     labeled, num_features = ndimage.label(binary_mask)
     count_cut = 0
@@ -156,36 +229,38 @@ def export_air_with_layers(binary_mask, pixel_size_x, pixel_size_y, msp):
         padded = np.pad(region, pad_width=2, mode='constant', constant_values=False)
         contours = measure.find_contours(padded.astype(float), level=0.5)
         
-        if len(contours) == 0:
-            continue
+        if len(contours) == 0: continue
         
-        # Sắp xếp: dài nhất = outer, còn lại = holes
+        # Sắp xếp: dài nhất = outer (vỏ), còn lại = inner (đảo)
         contours_sorted = sorted(contours, key=len, reverse=True)
         
         for i, contour in enumerate(contours_sorted):
-            # Chuyển sang mm - KHÔNG simplify, giữ nguyên pixel
-            points = []
-            for row, col in contour:
-                x_mm = (col - 2) * pixel_size_x
-                y_mm = (row - 2) * pixel_size_y
-                points.append((x_mm, y_mm))
+            # === ÁP DỤNG HYBRID PROCESSING ===
+            # Bước này biến Pixel -> Vector mượt -> Vector sạch biên
+            processed_points = apply_hybrid_processing(contour, pixel_size_x, pixel_size_y, R_in, R_out)
             
-            if len(points) >= 3:
-                if i == 0:
-                    layer = "CUT_GROUP"
-                    count_cut += 1
-                else:
-                    layer = "KEEP_GROUP"
-                    count_keep += 1
-                
-                msp.add_lwpolyline(points, close=True, dxfattribs={'layer': layer})
-                all_contours.append(contour)
+            if len(processed_points) < 3: continue
+            
+            if i == 0:
+                # Vỏ ngoài: Dùng để cắt -> Layer CUT
+                layer = "CUT_GROUP"
+                count_cut += 1
+            else:
+                # Đảo bên trong: Giữ nguyên -> Layer KEEP
+                # Lưu ý: Hàm apply_hybrid_processing vẫn an toàn với đảo
+                # vì đảo nằm giữa, không chạm biên R_out/Angle nên sẽ không bị Overshoot
+                layer = "KEEP_GROUP"
+                count_keep += 1
+            
+            msp.add_lwpolyline(processed_points, close=True, dxfattribs={'layer': layer})
+            all_contours.append(contour) # Lưu contour gốc để vẽ hình visualization
     
     return count_cut, count_keep, all_contours
 
 def export_magnet_as_polyline(binary_mask, pixel_size_x, pixel_size_y, msp, layer_name):
     """
-    Export Magnet - NỘI SUY PIXEL (không simplify)
+    Export Magnet - CÓ SIMPLIFY (Làm mượt)
+    Để tránh lưới Ansys bị nát do răng cưa pixel
     """
     labeled, num_features = ndimage.label(binary_mask)
     all_contours = []
@@ -193,21 +268,33 @@ def export_magnet_as_polyline(binary_mask, pixel_size_x, pixel_size_y, msp, laye
     
     for label_id in range(1, num_features + 1):
         region = (labeled == label_id)
+        # Pad để contour không bị đứt nếu chạm biên ảnh
         padded = np.pad(region, pad_width=2, mode='constant', constant_values=False)
         contours = measure.find_contours(padded.astype(float), level=0.5)
         
         for contour in contours:
-            # Chuyển sang mm - KHÔNG simplify
-            points = []
+            if len(contour) < 3: continue
+
+            # 1. Chuyển sang mm
+            points_mm = []
             for row, col in contour:
                 x_mm = (col - 2) * pixel_size_x
                 y_mm = (row - 2) * pixel_size_y
-                points.append((x_mm, y_mm))
+                points_mm.append([x_mm, y_mm])
             
-            if len(points) >= 3:
-                msp.add_lwpolyline(points, close=True, dxfattribs={'layer': layer_name})
-                all_contours.append(contour)
-                count += 1
+            # 2. QUAN TRỌNG: LÀM MƯỢT (Smoothing)
+            # tolerance=0.05 giúp khử răng cưa nhưng vẫn giữ dáng chữ nhật/cong của nam châm
+            # Nếu không có dòng này, Ansys sẽ "khóc thét" vì lưới quá dày!
+            points_array = np.array(points_mm)
+            simplified_array = approximate_polygon(points_array, tolerance=0.05)
+            
+            # 3. Vẽ DXF
+            # Chuyển về list tuple cho ezdxf
+            final_points = [(p[0], p[1]) for p in simplified_array]
+            
+            msp.add_lwpolyline(final_points, close=True, dxfattribs={'layer': layer_name})
+            all_contours.append(contour)
+            count += 1
     
     return count, all_contours
 
