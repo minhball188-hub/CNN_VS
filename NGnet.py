@@ -2,25 +2,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from skimage import measure
+from skimage.measure import approximate_polygon
 from scipy import ndimage
+from scipy.ndimage import binary_dilation
 import ezdxf
 
 # ==========================================
-# PHẦN 1: SINH HÌNH
+# THIẾT LẬP
 # ==========================================
-
-def ngnet_generate_shape(weights, centers, grid_x, grid_y, sigma):
-    function_value = np.zeros_like(grid_x)
-    sum_gaussian = np.zeros_like(grid_x)
-    for w, center in zip(weights, centers):
-        dist_sq = (grid_x - center[0])**2 + (grid_y - center[1])**2
-        g = np.exp(-dist_sq / (2 * sigma**2))
-        function_value += w * g
-        sum_gaussian += g
-    sum_gaussian[sum_gaussian == 0] = 1e-10
-    return function_value / sum_gaussian
-
-# --- THIẾT LẬP ---
 R_out = 39; R_in = 16.0; resolution = 1000
 x = np.linspace(0, R_out, resolution)
 y = np.linspace(0, R_out, resolution)
@@ -31,23 +20,26 @@ pixel_size_y = R_out / (resolution - 1)
 
 radius = np.sqrt(GX**2 + GY**2)
 angle = np.arctan2(GY, GX) * 180 / np.pi
+
 mask_rotor_region = (radius >= R_in) & (radius <= R_out) & (angle >= 0) & (angle <= 90)
+mask_0_45 = (angle >= 0) & (angle <= 45)
+mask_45_90 = angle > 45
 
 # ==========================================
 # SEED CHUNG
 # ==========================================
-SEED = 1  # Thay đổi seed này để random thiết kế khác
+SEED = 1
 np.random.seed(SEED)
 
 # ==========================================
-# NAM CHÂM
+# NAM CHÂM (0-90°, không cần đối xứng)
 # ==========================================
 def generate_random_magnet_config(R_in, R_out, num_magnets=1):
     magnets = []
     for _ in range(num_magnets):
         margin = 3.0
         r_center = np.random.uniform(R_in + margin, R_out - margin)
-        theta_center = np.random.uniform(2, 88)
+        theta_center = np.random.uniform(2, 88)  # 0-90° bình thường
         center_x = r_center * np.cos(np.deg2rad(theta_center))
         center_y = r_center * np.sin(np.deg2rad(theta_center))
         width = np.random.uniform(12, 20)
@@ -66,160 +58,83 @@ def create_magnet_mask(GX, GY, center_x, center_y, width, thickness, angle, regi
     return (np.abs(rotated_X) <= width/2) & (np.abs(rotated_Y) <= thickness/2) & region_mask
 
 magnets_config = generate_random_magnet_config(R_in, R_out, num_magnets=1)
-mask_magnet = np.zeros_like(GX, dtype=bool)
+magnet_mask = np.zeros_like(GX, dtype=bool)
 for m in magnets_config:
-    mask_magnet |= create_magnet_mask(GX, GY, m['center_x'], m['center_y'],
+    magnet_mask |= create_magnet_mask(GX, GY, m['center_x'], m['center_y'],
                                        m['width'], m['thickness'], m['angle'], mask_rotor_region)
 
 print(f"Nam châm: pos=({magnets_config[0]['center_x']:.1f}, {magnets_config[0]['center_y']:.1f})")
 
 # ==========================================
-# NGNET 0-45° + MIRROR
+# NGNET - CHỈ TẠO Ở 0-45°
 # ==========================================
+def ngnet_generate_shape(weights, centers, grid_x, grid_y, sigma):
+    function_value = np.zeros_like(grid_x)
+    sum_gaussian = np.zeros_like(grid_x)
+    for w, center in zip(weights, centers):
+        dist_sq = (grid_x - center[0])**2 + (grid_y - center[1])**2
+        g = np.exp(-dist_sq / (2 * sigma**2))
+        function_value += w * g
+        sum_gaussian += g
+    sum_gaussian[sum_gaussian == 0] = 1e-10
+    return function_value / sum_gaussian
+
+# Centers chỉ ở 0-45°
 centers = []
 for r in np.linspace(R_in+2, R_out-2, 6):
-    for theta in np.linspace(2, 43, 6):
+    for theta in np.linspace(2, 43, 6):  # 0-45°
         centers.append([r * np.cos(np.deg2rad(theta)), r * np.sin(np.deg2rad(theta))])
 
 weights = np.random.uniform(-1.0, 1.0, len(centers))
 phi_value = ngnet_generate_shape(weights, centers, GX, GY, sigma=4.0)
 
-# Mirror theo đường 45° - hoán đổi X và Y
-# Với điểm (x,y) ở vùng 45-90°, lấy giá trị từ điểm (y,x) ở vùng 0-45°
-phi_mirrored = phi_value.copy()
-ang = np.arctan2(GY, GX) * 180 / np.pi
-mask_45_90 = ang > 45
+# Air mask - tràn ra biên CHỈ KHI CHẠM BIÊN
+DILATE_MM = 0.1
+DILATE_ANGLE = np.degrees(DILATE_MM / ((R_in + R_out) / 2))  # Chuyển mm sang độ ở bán kính trung bình
 
-# Tạo grid mirror: điểm (i,j) lấy giá trị từ (j,i)
-phi_mirrored[mask_45_90] = phi_value.T[mask_45_90]
+# Vùng rotor gốc (0-45°)
+mask_rotor_half = mask_rotor_region & mask_0_45
 
-# ĐẢM BẢO ĐỐI XỨNG HOÀN HẢO: Làm đối xứng air_mask sau khi threshold
-# Thay vì mirror phi rồi threshold, ta threshold trước rồi mirror mask
+# Air gốc trong vùng rotor
+air_original = (phi_value < 0) & mask_rotor_half
 
-# ==========================================
-# TẠO MASK ĐỘC LẬP
-# ==========================================
-# Air từ NGnet
-air_mask_raw = (phi_mirrored < 0) & mask_rotor_region
+# Kiểm tra air có chạm các biên không
+touches_Rout = np.any(air_original & (radius >= R_out - 0.5))
+touches_Rin = np.any(air_original & (radius <= R_in + 0.5))
+touches_angle_0 = np.any(air_original & (angle <= 1))
+touches_angle_45 = np.any(air_original & (angle >= 44))
 
-# ĐẢM BẢO ĐỐI XỨNG HOÀN HẢO theo đường 45°
-air_mask_sym = air_mask_raw.copy()
-air_mask_sym[mask_45_90] = air_mask_raw.T[mask_45_90]
+# Tạo vùng mở rộng tùy theo biên nào được chạm
+r_min = R_in - DILATE_MM if touches_Rin else R_in
+r_max = R_out + DILATE_MM if touches_Rout else R_out
+angle_min = -DILATE_ANGLE if touches_angle_0 else 0
+angle_max = 45 + DILATE_ANGLE if touches_angle_45 else 45  # Góc 45 chỉ tràn 0.5mm
 
-# TRÀN RA NGOÀI Rin và Rout để cắt an toàn
-from scipy.ndimage import binary_dilation
+mask_rotor_extended = (radius >= r_min) & (radius <= r_max) & \
+                      (angle >= angle_min) & (angle <= angle_max)
 
-DILATE_MM = 0.5  # mm tràn ra
-DILATE_PIXELS = int(DILATE_MM / pixel_size_x) + 1
+# Air trong vùng mở rộng
+air_mask_half = (phi_value < 0) & mask_rotor_extended
 
-air_dilated = binary_dilation(air_mask_sym, iterations=DILATE_PIXELS)
+print(f"Air chạm biên: Rout={touches_Rout}, Rin={touches_Rin}, 0°={touches_angle_0}, 45°={touches_angle_45}")
+print(f"Tràn: Rin={r_min:.1f}, Rout={r_max:.1f}, angle=[{angle_min:.1f}°, {angle_max:.1f}°]")
 
-# Vùng ngoài biên rotor
-outside_Rout = (radius > R_out) & (radius <= R_out + DILATE_MM * 2)
-inside_Rin = (radius < R_in) & (radius >= R_in - DILATE_MM * 2)
-outside_rotor = outside_Rout | inside_Rin
-
-# Air = air gốc + phần tràn ra ngoài biên
-air_mask = air_mask_sym | (air_dilated & outside_rotor)
-
-print(f"Air tràn {DILATE_MM}mm ra ngoài Rin/Rout")
-
-# Magnet - NGUYÊN
-magnet_mask = mask_magnet
-
-# Display
-display_design = np.full_like(GX, -1)
-display_design[air_mask] = 0
-display_design[magnet_mask] = 2
-
-print(f"Air pixels: {np.sum(air_mask)}")
+# Tạo air_mask đầy đủ để hiển thị
+air_mask_full = air_mask_half.copy()
+air_mask_full[mask_45_90] = air_mask_half.T[mask_45_90]
+print(f"Air pixels (nửa 0-45): {np.sum(air_mask_half)}")
 print(f"Magnet pixels: {np.sum(magnet_mask)}")
-print(f"Overlap pixels: {np.sum(air_mask & magnet_mask)}")
 
 # ==========================================
 # EXPORT FUNCTIONS
 # ==========================================
 
-# ==========================================
-# EXPORT FUNCTIONS (HYBRID & SMART)
-# ==========================================
-from skimage.measure import approximate_polygon
-
-def apply_hybrid_processing(contour_pixels, pixel_size_x, pixel_size_y, R_in, R_out):
+def export_air_with_mirror(binary_mask_half, pixel_size_x, pixel_size_y, msp, tolerance=0.1):
     """
-    THUẬT TOÁN HYBRID:
-    1. Chuyển đổi Pixel -> MM.
-    2. Làm mượt toàn bộ (Smooth) để khử răng cưa bên trong.
-    3. Xử lý biên (Snap & Overshoot): Nếu điểm nằm gần biên, ép nó ra ngoài hẳn.
+    Export Air: simplify ở 0-45° rồi mirror sang 45-90°
+    Xuất thành 2 MẢNH RIÊNG BIỆT (không ghép)
     """
-    # 1. Chuyển sang tọa độ thực (MM)
-    # Lưu ý: contour của skimage trả về (row, col) -> (y, x)
-    points_mm = []
-    for row, col in contour_pixels:
-        x = (col - 2) * pixel_size_x  # Trừ padding
-        y = (row - 2) * pixel_size_y
-        points_mm.append([x, y])
-    
-    # 2. LÀM MƯỢT (SMOOTHING)
-    # tolerance=0.05mm: Đủ lớn để xóa răng cưa pixel (0.04mm), đủ nhỏ để giữ dáng cong
-    points_array = np.array(points_mm)
-    simplified_array = approximate_polygon(points_array, tolerance=0.05)
-    
-    # 3. XỬ LÝ BIÊN (SNAP & OVERSHOOT)
-    # Mục tiêu: Đảm bảo biên cắt sạch, không để lại răng cưa ở R_out hay 0 độ
-    final_points = []
-    
-    # Ngưỡng để nhận diện điểm biên (dựa trên sai số làm mượt + pixel)
-    # Nếu điểm cách biên < 0.8mm thì coi như là điểm biên -> Đẩy lố ra
-    BOUNDARY_THRESHOLD = 0.8 
-    OVERSHOOT_VAL = 1.0 # Đẩy ra ngoài 1mm để cắt cho ngọt
-    
-    for p in simplified_array:
-        x, y = p[0], p[1]
-        r = np.sqrt(x**2 + y**2)
-        
-        new_x, new_y = x, y
-        is_boundary_point = False
-        
-        # --- Check R_out (Biên ngoài) ---
-        if abs(r - R_out) < BOUNDARY_THRESHOLD:
-            # Đẩy bán kính ra R_out + 1mm
-            ratio = (R_out + OVERSHOOT_VAL) / r
-            new_x *= ratio
-            new_y *= ratio
-            is_boundary_point = True
-            
-        # --- Check R_in (Biên trong - nếu có) ---
-        elif abs(r - R_in) < BOUNDARY_THRESHOLD:
-            # Đẩy bán kính vào R_in - 1mm
-            ratio = (R_in - OVERSHOOT_VAL) / r
-            new_x *= ratio
-            new_y *= ratio
-            is_boundary_point = True
-
-        # --- Check Góc 0 độ (Trục X) ---
-        # Nếu y rất nhỏ -> Đẩy y xuống âm
-        if abs(y) < BOUNDARY_THRESHOLD and x > 0:
-            new_y = -OVERSHOOT_VAL
-            is_boundary_point = True
-            
-        # --- Check Góc 90 độ (Trục Y) ---
-        # Nếu x rất nhỏ -> Đẩy x xuống âm (sang trái)
-        if abs(x) < BOUNDARY_THRESHOLD and y > 0:
-            new_x = -OVERSHOOT_VAL
-            is_boundary_point = True
-            
-        final_points.append((new_x, new_y))
-        
-    return final_points
-
-def export_air_with_layers(binary_mask, pixel_size_x, pixel_size_y, msp):
-    """
-    Export Air với chiến thuật Hybrid:
-    - Vỏ ngoài (CUT_GROUP): Overshoot mạnh để cắt biên.
-    - Đảo trong (KEEP_GROUP): Chỉ làm mượt, giữ nguyên vị trí.
-    """
-    labeled, num_features = ndimage.label(binary_mask)
+    labeled, num_features = ndimage.label(binary_mask_half)
     count_cut = 0
     count_keep = 0
     all_contours = []
@@ -229,38 +144,51 @@ def export_air_with_layers(binary_mask, pixel_size_x, pixel_size_y, msp):
         padded = np.pad(region, pad_width=2, mode='constant', constant_values=False)
         contours = measure.find_contours(padded.astype(float), level=0.5)
         
-        if len(contours) == 0: continue
+        if len(contours) == 0:
+            continue
         
-        # Sắp xếp: dài nhất = outer (vỏ), còn lại = inner (đảo)
         contours_sorted = sorted(contours, key=len, reverse=True)
         
         for i, contour in enumerate(contours_sorted):
-            # === ÁP DỤNG HYBRID PROCESSING ===
-            # Bước này biến Pixel -> Vector mượt -> Vector sạch biên
-            processed_points = apply_hybrid_processing(contour, pixel_size_x, pixel_size_y, R_in, R_out)
+            # Chuyển sang mm
+            points_mm = []
+            for row, col in contour:
+                x_mm = (col - 2) * pixel_size_x
+                y_mm = (row - 2) * pixel_size_y
+                points_mm.append((x_mm, y_mm))
             
-            if len(processed_points) < 3: continue
+            # Simplify
+            points_array = np.array(points_mm)
+            simplified = approximate_polygon(points_array, tolerance=tolerance)
+            points_half = [(p[0], p[1]) for p in simplified]
             
-            if i == 0:
-                # Vỏ ngoài: Dùng để cắt -> Layer CUT
-                layer = "CUT_GROUP"
-                count_cut += 1
-            else:
-                # Đảo bên trong: Giữ nguyên -> Layer KEEP
-                # Lưu ý: Hàm apply_hybrid_processing vẫn an toàn với đảo
-                # vì đảo nằm giữa, không chạm biên R_out/Angle nên sẽ không bị Overshoot
-                layer = "KEEP_GROUP"
-                count_keep += 1
+            # Mirror: (x, y) → (y, x)
+            points_mirrored = [(p[1], p[0]) for p in points_half]
             
-            msp.add_lwpolyline(processed_points, close=True, dxfattribs={'layer': layer})
-            all_contours.append(contour) # Lưu contour gốc để vẽ hình visualization
+            layer = "CUT_GROUP" if i == 0 else "KEEP_GROUP"
+            
+            # XUẤT 2 MẢNH RIÊNG BIỆT
+            if len(points_half) >= 3:
+                msp.add_lwpolyline(points_half, close=True, dxfattribs={'layer': layer})
+                all_contours.append(points_half)
+                if i == 0:
+                    count_cut += 1
+                else:
+                    count_keep += 1
+            
+            if len(points_mirrored) >= 3:
+                msp.add_lwpolyline(points_mirrored, close=True, dxfattribs={'layer': layer})
+                all_contours.append(points_mirrored)
+                if i == 0:
+                    count_cut += 1
+                else:
+                    count_keep += 1
     
     return count_cut, count_keep, all_contours
 
-def export_magnet_as_polyline(binary_mask, pixel_size_x, pixel_size_y, msp, layer_name):
+def export_magnet_as_polyline(binary_mask, pixel_size_x, pixel_size_y, msp, layer_name, tolerance=0.5):
     """
-    Export Magnet - CÓ SIMPLIFY (Làm mượt)
-    Để tránh lưới Ansys bị nát do răng cưa pixel
+    Export Magnet - simplify bình thường (không cần đối xứng)
     """
     labeled, num_features = ndimage.label(binary_mask)
     all_contours = []
@@ -268,33 +196,24 @@ def export_magnet_as_polyline(binary_mask, pixel_size_x, pixel_size_y, msp, laye
     
     for label_id in range(1, num_features + 1):
         region = (labeled == label_id)
-        # Pad để contour không bị đứt nếu chạm biên ảnh
         padded = np.pad(region, pad_width=2, mode='constant', constant_values=False)
         contours = measure.find_contours(padded.astype(float), level=0.5)
         
         for contour in contours:
-            if len(contour) < 3: continue
-
-            # 1. Chuyển sang mm
             points_mm = []
             for row, col in contour:
                 x_mm = (col - 2) * pixel_size_x
                 y_mm = (row - 2) * pixel_size_y
-                points_mm.append([x_mm, y_mm])
+                points_mm.append((x_mm, y_mm))
             
-            # 2. QUAN TRỌNG: LÀM MƯỢT (Smoothing)
-            # tolerance=0.05 giúp khử răng cưa nhưng vẫn giữ dáng chữ nhật/cong của nam châm
-            # Nếu không có dòng này, Ansys sẽ "khóc thét" vì lưới quá dày!
             points_array = np.array(points_mm)
-            simplified_array = approximate_polygon(points_array, tolerance=0.05)
+            simplified = approximate_polygon(points_array, tolerance=tolerance)
+            points = [(p[0], p[1]) for p in simplified]
             
-            # 3. Vẽ DXF
-            # Chuyển về list tuple cho ezdxf
-            final_points = [(p[0], p[1]) for p in simplified_array]
-            
-            msp.add_lwpolyline(final_points, close=True, dxfattribs={'layer': layer_name})
-            all_contours.append(contour)
-            count += 1
+            if len(points) >= 3:
+                msp.add_lwpolyline(points, close=True, dxfattribs={'layer': layer_name})
+                all_contours.append(points)
+                count += 1
     
     return count, all_contours
 
@@ -303,22 +222,35 @@ def export_magnet_as_polyline(binary_mask, pixel_size_x, pixel_size_y, msp, laye
 # ==========================================
 doc = ezdxf.new()
 msp = doc.modelspace()
-doc.layers.add(name="CUT_GROUP", color=4)    # Cyan - cắt khỏi rotor
-doc.layers.add(name="KEEP_GROUP", color=3)   # Green - giữ lại (đảo thép)
-doc.layers.add(name="MAGNET", color=1)       # Red - nam châm
+doc.layers.add(name="CUT_GROUP", color=4)
+doc.layers.add(name="KEEP_GROUP", color=3)
+doc.layers.add(name="MAGNET", color=1)
 
-# Air - chia 2 layers
-num_cut, num_keep, air_contours = export_air_with_layers(air_mask, pixel_size_x, pixel_size_y, msp)
+# Air - simplify rồi mirror
+num_cut, num_keep, air_contours = export_air_with_mirror(air_mask_half, pixel_size_x, pixel_size_y, msp)
 
-# Magnet - Polyline
+# Magnet - simplify bình thường
 num_mag, mag_contours = export_magnet_as_polyline(magnet_mask, pixel_size_x, pixel_size_y, msp, "MAGNET")
 
 filename = "rotor_design.dxf"
 doc.saveas(filename)
 print(f"\nFile: {filename}")
-print(f"  CUT_GROUP (viền ngoài air): {num_cut}")
-print(f"  KEEP_GROUP (đảo thép): {num_keep}")
+print(f"  CUT_GROUP: {num_cut}")
+print(f"  KEEP_GROUP: {num_keep}")
 print(f"  MAGNET: {num_mag}")
+
+# Kiểm tra đối xứng
+for entity in msp:
+    if entity.dxftype() == 'LWPOLYLINE' and entity.dxf.layer == 'CUT_GROUP':
+        points = list(entity.get_points())
+        on_x = [p[0] for p in points if abs(p[1]) < 0.1]
+        on_y = [p[1] for p in points if abs(p[0]) < 0.1]
+        if on_x and on_y:
+            print(f"\nĐối xứng check:")
+            print(f"  Trục X max: {max(on_x):.6f}")
+            print(f"  Trục Y max: {max(on_y):.6f}")
+            print(f"  Chênh lệch: {abs(max(on_x) - max(on_y)):.6f} mm")
+        break
 
 # ==========================================
 # VISUALIZATION
@@ -326,14 +258,18 @@ print(f"  MAGNET: {num_mag}")
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
 ax1 = axes[0]
+display = np.full_like(GX, -1)
+display[air_mask_full] = 0
+display[magnet_mask] = 2
 cmap = ListedColormap(['white', 'cyan', 'gray', 'red'])
-ax1.pcolormesh(GX, GY, display_design, cmap=cmap, vmin=-1, vmax=2, shading='auto')
-ax1.set_title("Pixel View (Air=cyan, Magnet=đỏ)")
-ax1.plot([0, R_out], [0, R_out], 'g--', lw=2)
+ax1.pcolormesh(GX, GY, display, cmap=cmap, vmin=-1, vmax=2, shading='auto')
+ax1.set_title("Pixel View")
+ax1.plot([0, R_out], [0, R_out], 'g--', lw=2, label='45°')
 ax1.set_aspect('equal')
+ax1.legend()
 
 ax2 = axes[1]
-ax2.set_title("Contours xuất DXF")
+ax2.set_title("Contours DXF (đã simplify + mirror)")
 
 # Biên rotor
 theta_arc = np.linspace(0, np.pi/2, 100)
@@ -344,16 +280,17 @@ ax2.plot([0, 0], [R_in, R_out], 'k-', lw=1)
 
 # Air contours
 for contour in air_contours:
-    xs = [(c[1]-2) * pixel_size_x for c in contour] + [(contour[0][1]-2) * pixel_size_x]
-    ys = [(c[0]-2) * pixel_size_y for c in contour] + [(contour[0][0]-2) * pixel_size_y]
+    xs = [p[0] for p in contour] + [contour[0][0]]
+    ys = [p[1] for p in contour] + [contour[0][1]]
     ax2.plot(xs, ys, 'b-', lw=1)
 
 # Magnet contours
 for contour in mag_contours:
-    xs = [(c[1]-2) * pixel_size_x for c in contour] + [(contour[0][1]-2) * pixel_size_x]
-    ys = [(c[0]-2) * pixel_size_y for c in contour] + [(contour[0][0]-2) * pixel_size_y]
+    xs = [p[0] for p in contour] + [contour[0][0]]
+    ys = [p[1] for p in contour] + [contour[0][1]]
     ax2.plot(xs, ys, 'r-', lw=1.5)
 
+ax2.plot([0, R_out], [0, R_out], 'g--', lw=1, alpha=0.5)
 ax2.set_aspect('equal')
 ax2.set_xlim(-2, R_out + 2)
 ax2.set_ylim(-2, R_out + 2)
