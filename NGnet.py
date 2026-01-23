@@ -83,10 +83,25 @@ def ngnet_generate_shape(weights, centers, grid_x, grid_y, sigma):
     return function_value / sum_gaussian
 
 # Centers - KHÔNG giới hạn, cho phép chạm biên
-centers = []
-for r in np.linspace(R_in, R_out, 6):       # Bỏ +2, -2
-    for theta in np.linspace(0, 45, 6):      # Bỏ 2, 43 → full 0-45
-        centers.append([r * np.cos(np.deg2rad(theta)), r * np.sin(np.deg2rad(theta))])
+# CODE MỚI (Mật độ đều nhau - Giống bài báo)
+# 1. Tạo lưới chữ nhật bao quanh vùng 0-45 độ
+num_points_1d = 8  # Tăng/giảm số này để thay đổi mật độ (tương đương resolution)
+x_grid = np.linspace(0, R_out, num_points_1d)
+y_grid = np.linspace(0, R_out, num_points_1d)
+XX, YY = np.meshgrid(x_grid, y_grid)
+
+# 2. Tính bán kính và góc cho lưới này để lọc
+RR = np.sqrt(XX**2 + YY**2)
+AA = np.arctan2(YY, XX) * 180 / np.pi
+
+# 3. Lọc lấy các điểm nằm TRONG vùng thiết kế
+# (Nằm giữa Rin, Rout VÀ góc từ 0 đến 45)
+mask_centers = (RR >= R_in) & (RR <= R_out) & (AA >= 0) & (AA <= 45)
+
+# 4. Lấy danh sách tọa độ
+centers = np.column_stack((XX[mask_centers], YY[mask_centers]))
+
+print(f"Số lượng tâm Gaussian sinh ra: {len(centers)}")
 
 weights = np.random.uniform(-1.0, 1.0, len(centers))
 phi_value = ngnet_generate_shape(weights, centers, GX, GY, sigma=4.0)
