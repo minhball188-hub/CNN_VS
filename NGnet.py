@@ -28,48 +28,45 @@ mask_45_90 = angle > 45
 # ==========================================
 # SEED CHUNG
 # ==========================================
-SEED = 2
+SEED = 100
 np.random.seed(SEED)
 
 # ==========================================
-# NAM CHÂM (tâm trên đường y=x, không xoay)
+# NAM CHÂM (4 góc cố định)
 # ==========================================
-def generate_random_magnet_config(R_in, R_out, num_magnets=1):
-    magnets = []
-    for _ in range(num_magnets):
-        margin = 3.0
-        # Tâm nằm trên đường y = x (góc 45°)
-        r_center = np.random.uniform(R_in + margin, R_out - margin)
-        theta_center = 45  # CỐ ĐỊNH trên đường 45°
-        center_x = r_center * np.cos(np.deg2rad(theta_center))
-        center_y = r_center * np.sin(np.deg2rad(theta_center))
-        
-        # Kích thước random
-        width = np.random.uniform(10, 100)                                               #magnet random litmit
-        thickness = np.random.uniform(10, 100)
-        
-        # Góc CỐ ĐỊNH 45° (bề mặt vuông góc với vector (1,1))
-        ang = 45
-        
-        magnets.append({'center_x': center_x, 'center_y': center_y, 
-                       'width': width, 'thickness': thickness, 'angle': ang})
-    return magnets
+# 4 tọa độ góc nam châm (hình chữ nhật)
+MAGNET_CORNERS = [
+    (9.62938, 30.84258),
+    (30.84258, 9.62938),
+    (7.50806, 28.72126),
+    (28.72126, 7.50806)
+]
 
-def create_magnet_mask(GX, GY, center_x, center_y, width, thickness, angle, region_mask):
-    dX = GX - center_x
-    dY = GY - center_y
-    angle_rad = np.deg2rad(angle)
-    rotated_X = dX * np.cos(angle_rad) + dY * np.sin(angle_rad)
-    rotated_Y = -dX * np.sin(angle_rad) + dY * np.cos(angle_rad)
-    return (np.abs(rotated_X) <= width/2) & (np.abs(rotated_Y) <= thickness/2) & region_mask
+def create_magnet_mask_from_corners(GX, GY, corners, region_mask):
+    """Tạo mask nam châm từ 4 góc"""
+    from matplotlib.path import Path
+    
+    # Tạo polygon path từ 4 góc
+    # Sắp xếp các góc theo thứ tự để tạo hình chữ nhật đúng
+    # Góc: (9.6, 30.8), (7.5, 28.7), (28.7, 7.5), (30.8, 9.6)
+    sorted_corners = [
+        corners[2],  # (7.50806, 28.72126) - top-left
+        corners[0],  # (9.62938, 30.84258) - top-right  
+        corners[1],  # (30.84258, 9.62938) - bottom-right
+        corners[3],  # (28.72126, 7.50806) - bottom-left
+    ]
+    
+    path = Path(sorted_corners)
+    
+    # Kiểm tra từng điểm trong grid
+    points = np.column_stack((GX.ravel(), GY.ravel()))
+    mask = path.contains_points(points).reshape(GX.shape)
+    
+    return mask & region_mask
 
-magnets_config = generate_random_magnet_config(R_in, R_out, num_magnets=1)
-magnet_mask = np.zeros_like(GX, dtype=bool)
-for m in magnets_config:
-    magnet_mask |= create_magnet_mask(GX, GY, m['center_x'], m['center_y'],
-                                       m['width'], m['thickness'], m['angle'], mask_rotor_region)
+magnet_mask = create_magnet_mask_from_corners(GX, GY, MAGNET_CORNERS, mask_rotor_region)
 
-print(f"Nam châm: pos=({magnets_config[0]['center_x']:.1f}, {magnets_config[0]['center_y']:.1f})")
+print(f"Nam châm: 4 góc cố định")
 
 # ==========================================
 # NGNET - CHỈ TẠO Ở 0-45°
@@ -85,17 +82,17 @@ def ngnet_generate_shape(weights, centers, grid_x, grid_y, sigma):
     sum_gaussian[sum_gaussian == 0] = 1e-10
     return function_value / sum_gaussian
 
-# Centers chỉ ở 0-45°
+# Centers - KHÔNG giới hạn, cho phép chạm biên
 centers = []
-for r in np.linspace(R_in+2, R_out-2, 6):
-    for theta in np.linspace(2, 43, 6):  # 0-45°
+for r in np.linspace(R_in, R_out, 6):       # Bỏ +2, -2
+    for theta in np.linspace(0, 45, 6):      # Bỏ 2, 43 → full 0-45
         centers.append([r * np.cos(np.deg2rad(theta)), r * np.sin(np.deg2rad(theta))])
 
 weights = np.random.uniform(-1.0, 1.0, len(centers))
 phi_value = ngnet_generate_shape(weights, centers, GX, GY, sigma=4.0)
 
 # Air mask - tràn ra biên CHỈ KHI CHẠM BIÊN
-DILATE_MM = 0.5
+DILATE_MM = 0.2
 DILATE_ANGLE = np.degrees(DILATE_MM / ((R_in + R_out) / 2))  # Chuyển mm sang độ ở bán kính trung bình
 
 # Vùng rotor gốc (0-45°)
