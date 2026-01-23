@@ -28,23 +28,29 @@ mask_45_90 = angle > 45
 # ==========================================
 # SEED CHUNG
 # ==========================================
-SEED = 1
+SEED = 2
 np.random.seed(SEED)
 
 # ==========================================
-# NAM CHÂM (0-90°, không cần đối xứng)
+# NAM CHÂM (tâm trên đường y=x, không xoay)
 # ==========================================
 def generate_random_magnet_config(R_in, R_out, num_magnets=1):
     magnets = []
     for _ in range(num_magnets):
         margin = 3.0
+        # Tâm nằm trên đường y = x (góc 45°)
         r_center = np.random.uniform(R_in + margin, R_out - margin)
-        theta_center = np.random.uniform(2, 88)  # 0-90° bình thường
+        theta_center = 45  # CỐ ĐỊNH trên đường 45°
         center_x = r_center * np.cos(np.deg2rad(theta_center))
         center_y = r_center * np.sin(np.deg2rad(theta_center))
-        width = np.random.uniform(12, 20)
-        thickness = np.random.uniform(2.5, 5.0)
-        ang = np.random.uniform(0, 90)
+        
+        # Kích thước random
+        width = np.random.uniform(10, 100)                                               #magnet random litmit
+        thickness = np.random.uniform(10, 100)
+        
+        # Góc CỐ ĐỊNH 45° (bề mặt vuông góc với vector (1,1))
+        ang = 45
+        
         magnets.append({'center_x': center_x, 'center_y': center_y, 
                        'width': width, 'thickness': thickness, 'angle': ang})
     return magnets
@@ -89,7 +95,7 @@ weights = np.random.uniform(-1.0, 1.0, len(centers))
 phi_value = ngnet_generate_shape(weights, centers, GX, GY, sigma=4.0)
 
 # Air mask - tràn ra biên CHỈ KHI CHẠM BIÊN
-DILATE_MM = 0.1
+DILATE_MM = 0.5
 DILATE_ANGLE = np.degrees(DILATE_MM / ((R_in + R_out) / 2))  # Chuyển mm sang độ ở bán kính trung bình
 
 # Vùng rotor gốc (0-45°)
